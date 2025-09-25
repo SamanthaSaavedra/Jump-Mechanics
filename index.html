@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<title>Prototipo 2D – Dash + Ceiling Stick + Pogo (visible)</title>
+<style>
+  :root { --bg:#0e0f13; --fg:#e8f1ff; }
+  html,body{background:var(--bg);margin:0;height:100%;overflow:hidden;color:var(--fg);
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+  .wrap{position:fixed;inset:0;display:grid;place-items:center;}
+  canvas{
+    width:100vw;height:56.25vw;max-height:100vh;max-width:177.78vh;
+    background:linear-gradient(#0b0b10,#111520 60%,#0b0b10);
+    image-rendering:pixelated;image-rendering:crisp-edges;
+    box-shadow:0 10px 50px rgba(0,0,0,.5);border:1px solid rgba(255,255,255,.06);border-radius:12px;
+    touch-action:none;
+  }
+  .hud{position:fixed;top:12px;left:12px;font-size:12px;line-height:1.25;
+    background:rgba(10,14,22,.55);border:1px solid rgba(255,255,255,.08);
+    backdrop-filter:blur(4px);border-radius:8px;padding:8px 10px;white-space:pre;pointer-events:none;}
+  .actionBanner{
+    position:fixed;top:14px;left:50%;transform:translateX(-50%);
+    font-weight:800;letter-spacing:.5px;font-size:14px;color:#fff;
+    padding:6px 10px;border-radius:10px;background:rgba(255,255,255,.08);
+    border:1px solid rgba(255,255,255,.15);pointer-events:none;opacity:0;transition:opacity .12s ease;
+    text-shadow:0 1px 2px rgba(0,0,0,.5);
+  }
+  .touch{position:fixed;inset:0;pointer-events:none;}
+  .btn{position:absolute;width:74px;height:74px;border-radius:14px;display:grid;place-items:center;
+    background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);color:#fff;
+    font-weight:800;font-size:14px;user-select:none;-webkit-user-select:none;pointer-events:auto;touch-action:none;}
+  .btn:active{transform:translateY(1px) scale(.98);}
+  .btn.small{width:58px;height:58px;font-size:13px;}
+  .btn.tiny{width:54px;height:54px;font-size:12px;border-radius:12px;}
+  .left{left:16px;bottom:24px;} .right{left:100px;bottom:24px;}
+  .jump{right:16px;bottom:24px;} .dash{right:110px;bottom:24px;}
+  .down{right:18px;bottom:110px;} .up{right:112px;bottom:110px;}
+  .hint{position:fixed;bottom:8px;left:50%;transform:translateX(-50%);font-size:12px;opacity:.6;text-align:center;}
+</style>
+</head>
+<body>
+  <div class="wrap"><canvas id="game" width="1280" height="720"></canvas></div>
+  <div class="hud" id="hud"></div>
+  <div class="actionBanner" id="banner">JUMP</div>
+
+  <!-- Controles táctiles -->
+  <div class="touch" aria-hidden="false">
+    <div class="btn left"  id="btnLeft">◀︎</div>
+    <div class="btn right" id="btnRight">▶︎</div>
+    <div class="btn big jump" id="btnJump">JUMP</div>
+    <div class="btn small dash" id="btnDash">DASH</div>
+    <!-- NUEVOS: UP y DOWN para móvil -->
+    <div class="btn tiny down" id="btnDown">↓</div>
+    <div class="btn tiny up"   id="btnUp">↑</div>
+    <div class="hint">
+      PC: A/D o ←/→ · SPACE/W/↑ = JUMP (mantener = salto corto) · SHIFT/J/K = DASH · S/↓ = Fast-fall / Pogo prep<br>
+      POGO: en el aire mantén ↓ y toca JUMP; rebota si pisas arriba en &lt;0.12s · Techo: llega con DASH ↑, muévete pegada; JUMP te suelta ↓
+    </div>
+  </div>
+
+<script>
+/* ===================== CONSTANTES ===================== */
+const BASE_WIDTH=1280, BASE_HEIGHT=720, FIXED_DT=1/60;
+const UNIT=16, EPS=0.001;
+function u(v){return v*UNIT;}
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+function aabb(a,b){return !(a.x+a.w<=b.x||a.x>=b.x+b.w||a.y+a.h<=b.y||a.y>=b.y+b.h);}
+
+/* Física */
+const GRAVITY=60, FAST_FALL_MULT=2.0, WALL_SLIDE_FACTOR=0.4;
+const MOVE_SPEED=18, AIR_ACCEL=120;
+
+/* Salto variable (invertido) */
+const JUMP_BASE_H=3.0, JUMP_MAX_H=5.0, JUMP_HOLD_MAX=0.16;
+const COYOTE_TIME=0.10, JUMP_BUFFER=0.08;
+const INVERT_JUMP_HOLD=true;
+
+/* Doble salto + Wall jump */
+const ALLOW_DOUBLE_JUMP=true;
+const WALL_JUMP_VX=14, WALL_JUMP_VY=20;
+
+/* Dash (impulso corto tipo otro salto) */
+const DASH_SCALE=1.06;             // 1.03–1.12
+const DASH_UP_WINDOW=0.25;         // ventana p/ pegarse al techo tras dash con componente ↑
+const DASH_FX_TIME=0.10, GHOST_LIFE=0.18;
+
+/* Ceiling stick */
+const CEILING_COLOR="#ffdcdc";
+const CEILING_JUMP_VY=22;          // impulso hacia abajo al soltarte
+
+/* Pogo (HK) */
+const POGO_BUFFER=0.12;            // s
+const POGO_HEIGHT=4.0;
+
+/* Player & derivadas */
+const PLAYER_W=1.0, PLAYER_H=1.8, RESPAWN_Y_KILL=40;
+const vBase=Math.sqrt(2*GRAVITY*JUMP_BASE_H);
+const vMax =Math.sqrt(2*GRAVITY*JUMP_MAX_H);
+const POGO_VY=Math.sqrt(2*GRAVITY*POGO_HEIGHT);
+
+/* ===================== SETUP ===================== */
+const canvas=document.getElementById("game");
+const ctx=canvas.getContext("2d"); ctx.imageSmoothingEnabled=false;
+const banner=document.getElementById("banner");
+
+/* ===================== INPUT ===================== */
+const keys={left:false,right:false,up:false,down:false,jump:false,jumpHeld:false,dash:false};
+let lastDirX=1;
+function bindKeys(){
+  addEventListener("keydown",e=>{
+    const k=e.key.toLowerCase();
+    if(["arrowleft","a"].includes(k)){keys.left=true;lastDirX=-1;}
+    if(["arrowright","d"].includes(k)){keys.right=true;lastDirX= 1;}
+    if(["arrowup","w"," "].includes(k)){keys.up=true;keys.jump=true;keys.jumpHeld=true;}
+    if(["arrowdown","s"].includes(k)){keys.down=true;}
+    if(["shift","j","k"].includes(k)){keys.dash=true;}
+  });
+  addEventListener("keyup",e=>{
+    const k=e.key.toLowerCase();
+    if(["arrowleft","a"].includes(k)) keys.left=false;
+    if(["arrowright","d"].includes(k)) keys.right=false;
+    if(["arrowup","w"," "].includes(k)){keys.up=false;keys.jumpHeld=false;}
+    if(["arrowdown","s"].includes(k))  keys.down=false;
+    if(["shift","j","k"].includes(k))  keys.dash=false;
+  });
+}
+bindKeys();
+
+/* Táctil */
+function bindTouch(id,down,up){
+  const el=document.getElementById(id);
+  const start=ev=>{ev.preventDefault();down();};
+  const end=  ev=>{ev.preventDefault();up();  };
+  ["touchstart","pointerdown","mousedown"].forEach(t=>el.addEventListener(t,start));
+  ["touchend","touchcancel","pointerup","mouseup","mouseleave"].forEach(t=>el.addEventListener(t,end));
+}
+bindTouch("btnLeft", ()=>{keys.left=true;lastDirX=-1;}, ()=>{keys.left=false;});
+bindTouch("btnRight",()=>{keys.right=true;lastDirX= 1;}, ()=>{keys.right=false;});
+bindTouch("btnJump", ()=>{keys.jump=true;keys.jumpHeld=true;keys.up=true;}, ()=>{keys.jumpHeld=false;keys.up=false;});
+bindTouch("btnDash", ()=>{keys.dash=true;}, ()=>{ /* one-shot */ });
+bindTouch("btnDown",()=>{keys.down=true;},()=>{keys.down=false;});
+bindTouch("btnUp",  ()=>{keys.up=true;},  ()=>{keys.up=false;});
+
+/* ===================== NIVEL ===================== */
+const world={solids:[],goal:{x:108,y:6,w:2,h:3},start:{x:4,y:6}};
+(function buildLevel(){
+  const G=world.solids;
+  // 1) Piso
+  G.push({x:0,y:8,w:40,h:2});
+
+  // 2) Techo alto y grueso (solo alcanzable con dash ↑)
+  G.push({x:1.5,y:-2.6,w:10,h:1.4});
+
+  // 3) Tres gaps
+  G.push({x:40,y:8,w:10,h:2});
+  G.push({x:52,y:8,w:10,h:2});
+  G.push({x:65,y:8,w:10,h:2});
+  G.push({x:79,y:8,w:12,h:2});
+
+  // 4) Pasillo con techo bajo
+  G.push({x:92,y:6.2,w:10,h:0.5});
+  G.push({x:92,y:8,  w:10,h:2});
+
+  // 5) Pared + rampas + goal
+  G.push({x:105,y:2,w:1,h:8});
+  const baseX=110, baseY=8;
+  for(let i=0;i<8;i++) G.push({x:baseX+i*2,y:baseY-(i+1)*0.6,w:2,h:2+(i+1)*0.6});
+  G.push({x:126,y:4,w:12,h:6});
+
+  // Bordes
+  G.push({x:-10,y:10,w:200,h:10});
+  G.push({x:-10,y:-10,w:2,h:40});
+  G.push({x:150,y:-10,w:2,h:40});
+})();
+
+/* ===================== FX (ring + popups) ===================== */
+const ghosts=[];
+const rings=[]; // {x,y,r0,r1,life,max, color}
+const popups=[]; // {x,y,txt,life,max,color}
+function addRing(x,y,r0,r1,life,color){ rings.push({x,y,r0,r1,life,max:life,color}); }
+function addPopup(x,y,txt,color="#fff",life=0.9){ popups.push({x,y,txt,life,max:life,color}); setBanner(txt); }
+function setBanner(txt){
+  banner.textContent=txt;
+  banner.style.opacity=1;
+  clearTimeout(setBanner._t);
+  setBanner._t=setTimeout(()=>banner.style.opacity=0, 750);
+}
+
+/* ===================== JUGADOR ===================== */
+const player={
+  x:world.start.x, y:world.start.y, w:PLAYER_W, h:PLAYER_H,
+  vx:0, vy:0,
+  onGround:false, onLeftWall:false, onRightWall:false,
+  onCeiling:false, stuckCeil:-1, ceilWindowEnd:0,
+  coyoteTimer:0, bufferTimer:-999, jumpHeldTimer:0,
+  canDouble:true, canDash:true, usedDashThisAir:false,
+  pogoBuffer:0, // tiempo restante del buffer (s)
+  dashFx:0, airTime:0, respawns:0
+};
+
+/* ===================== COLISIONES ===================== */
+function moveAndCollide(p,dt){
+  p.onGround=false; p.onLeftWall=false; p.onRightWall=false;
+
+  // ---- X ----
+  p.x += p.vx*dt;
+  for(const s of world.solids){
+    if(!aabb(p,s)) continue;
+    if(p.vx>0){ p.x=s.x-p.w; p.onRightWall=true; }
+    else if(p.vx<0){ p.x=s.x+s.w; p.onLeftWall=true; }
+    p.vx=0;
+  }
+
+  // ---- Y ----
+  let headHit=false, headSolid=-1;
+  p.y += p.vy*dt;
+  for(let i=0;i<world.solids.length;i++){
+    const s=world.solids[i]; if(!aabb(p,s)) continue;
+
+    if(p.vy>0){ // cayendo
+      if(p.pogoBuffer>0 && keys.down){
+        // POGO: coloca justo encima y rebota
+        p.y = s.y - p.h - EPS; p.vy = -POGO_VY; p.onGround=false; p.pogoBuffer=0;
+        addRing(p.x+p.w/2, s.y, 0.1, 1.2, 0.25, "rgba(255,236,110,.7)");
+        addPopup(p.x, p.y-0.6, "POGO", "#ffec6e");
+        ghosts.push({x:p.x,y:p.y,w:p.w,h:p.h,life:GHOST_LIFE*0.7});
+      }else{
+        p.y = s.y - p.h; p.vy = 0; p.onGround=true; p.airTime=0;
+      }
+    } else if(p.vy<0){ // subiendo → golpe de cabeza
+      p.y = s.y + s.h; p.vy = 0; headHit=true; headSolid=i;
+    }
+  }
+  return {headHit, headSolid};
+}
+
+/* ===================== UTILS TECHO ===================== */
+function ceilingIndexUnderPlayer(p){
+  let best=-1, bestGap=0.08;
+  for(let i=0;i<world.solids.length;i++){
+    const s=world.solids[i];
+    const overlap = Math.min(p.x+p.w, s.x+s.w) - Math.max(p.x, s.x);
+    if(overlap>EPS){
+      const gap = Math.abs((s.y + s.h) - p.y);
+      if(gap <= bestGap){ best=i; bestGap=gap; }
+    }
+  }
+  return best;
+}
+
+/* ===================== UPDATE ===================== */
+let tNow=0;
+function update(dt){
+  tNow+=dt;
+  const p=player;
+
+  // Animaciones
+  if(p.dashFx>0) p.dashFx-=dt;
+  for(let i=ghosts.length-1;i>=0;i--){ ghosts[i].life-=dt; if(ghosts[i].life<=0) ghosts.splice(i,1); }
+  for(let i=rings.length-1;i>=0;i--){ rings[i].life-=dt; if(rings[i].life<=0) rings.splice(i,1); }
+  for(let i=popups.length-1;i>=0;i--){ popups[i].life-=dt; if(popups[i].life<=0) popups.splice(i,1); }
+
+  /* ===== PEGADO AL TECHO ===== */
+  if(p.onCeiling){
+    const want=(keys.left?-1:0)+(keys.right?1:0);
+    const targetVx=want*MOVE_SPEED;
+    p.vx += clamp(targetVx-p.vx, -AIR_ACCEL*dt, AIR_ACCEL*dt);
+    if(want!==0) lastDirX=want;
+
+    // mover solo X y resolver paredes
+    p.x += p.vx*dt;
+    for(const s of world.solids){
+      if(!aabb(p,s)) continue;
+      if(p.vx>0){ p.x=s.x-p.w; }
+      else if(p.vx<0){ p.x=s.x+s.w; }
+      p.vx=0;
+    }
+
+    // mantener Y pegada si hay techo
+    const idx=ceilingIndexUnderPlayer(p);
+    if(idx>=0){ const s=world.solids[idx]; p.y=s.y+s.h; p.vy=0; p.stuckCeil=idx; }
+    else { p.onCeiling=false; p.stuckCeil=-1; }
+
+    // JUMP desde techo → suelta con impulso hacia abajo
+    if(keys.jump || p.bufferTimer>0){
+      p.onCeiling=false; p.stuckCeil=-1; p.vy=CEILING_JUMP_VY; p.bufferTimer=-999;
+      addPopup(p.x, p.y-0.6, "CEILING DROP", "#ffd0d0");
+      addRing(p.x+p.w/2, p.y+p.h, 0.1, 1.0, 0.22, "rgba(255,208,208,.7)");
+    }
+    return; // no aplicar gravedad mientras esté pegada
+  }
+
+  /* ===== FÍSICA NORMAL ===== */
+  // Lateral
+  const want=(keys.left?-1:0)+(keys.right?1:0);
+  const targetVx=want*MOVE_SPEED;
+  const ax=(p.onGround?999:AIR_ACCEL);
+  p.vx += clamp(targetVx-p.vx, -ax*dt, ax*dt);
+  if(want!==0) lastDirX=want;
+
+  // Gravedad (wall slide / fast-fall)
+  let g=GRAVITY;
+  const sliding=(!p.onGround && (p.onLeftWall||p.onRightWall) && p.vy>0);
+  if(sliding) g*=WALL_SLIDE_FACTOR;
+  else if(keys.down && !p.onGround) g*=FAST_FALL_MULT;
+  p.vy += g*dt;
+
+  // Timers & buffers
+  if(p.onGround) p.coyoteTimer=COYOTE_TIME; else p.coyoteTimer=Math.max(0,p.coyoteTimer-dt);
+  p.airTime += (p.onGround?0:dt);
+  if(keys.jump){
+    p.bufferTimer=JUMP_BUFFER;
+    if(keys.down && !p.onGround){ p.pogoBuffer=POGO_BUFFER; } // armar pogo
+    keys.jump=false;
+  } else {
+    p.bufferTimer-=dt;
+    p.pogoBuffer=Math.max(0,p.pogoBuffer-dt);
+  }
+
+  // Saltos
+  const buffered=(p.bufferTimer>0);
+  const canJump=(p.coyoteTimer>0 || p.onGround);
+  const onWall=(!p.onGround && (p.onLeftWall||p.onRightWall));
+  if(buffered && (canJump || onWall)){
+    if(onWall){
+      const dir=p.onLeftWall?1:-1; p.vx=dir*WALL_JUMP_VX; p.vy=-WALL_JUMP_VY;
+      addPopup(p.x, p.y-0.6, "WALL JUMP", "#c0f");
+    } else {
+      p.vy=-vBase; p.jumpHeldTimer=JUMP_HOLD_MAX;
+      addPopup(p.x, p.y-0.6, "JUMP", "#9cf");
+    }
+    p.bufferTimer=-999; p.coyoteTimer=0;
+  }
+
+  // Salto variable (invertido)
+  const holdActive = INVERT_JUMP_HOLD ? !keys.jumpHeld : keys.jumpHeld;
+  if(p.jumpHeldTimer>0 && p.vy<0 && holdActive){ p.vy += (GRAVITY*0.35)*dt; p.jumpHeldTimer -= dt; }
+  else if (p.vy>=0){ p.jumpHeldTimer=0; }
+
+  // Doble salto (si no hubo dash)
+  if(ALLOW_DOUBLE_JUMP && buffered && !p.onGround && p.canDouble && !p.usedDashThisAir){
+    p.vy=-vBase; p.jumpHeldTimer=JUMP_HOLD_MAX*0.8; p.canDouble=false; p.bufferTimer=-999;
+    addPopup(p.x, p.y-0.6, "DOUBLE", "#adf7a8");
+  }
+
+  // Dash impulso corto (etiqueta con dirección)
+  if(keys.dash){ keys.dash=false;
+    if(p.canDash && !p.onGround){
+      let dx=(keys.left?-1:0)+(keys.right?1:0);
+      let dy=(keys.up?-1:0)+(keys.down?1:0);
+      if(dx===0 && dy===0){ dx=lastDirX||1; dy=0; }
+      const len=Math.hypot(dx,dy)||1; dx/=len; dy/=len;
+      const imp=vMax*DASH_SCALE; p.vx+=dx*imp; p.vy+=dy*imp;
+      p.canDash=false; p.usedDashThisAir=true; p.canDouble=false;
+      p.dashFx=DASH_FX_TIME; ghosts.push({x:p.x,y:p.y,w:p.w,h:p.h,life:GHOST_LIFE});
+      if(dy<-0.3) player.ceilWindowEnd = tNow + DASH_UP_WINDOW;
+      const dirTxt = dy<-0.5 ? "DASH ↑" : dy>0.5 ? "DASH ↓" : dx>0.5 ? "DASH →" : dx<-0.5 ? "DASH ←" : "DASH ↘";
+      addPopup(p.x, p.y-0.6, dirTxt, "#ffe38b");
+      addRing(p.x+p.w/2, p.y+p.h/2, .1, 1.0, .18, "rgba(255,255,255,.35)");
+    }
+  }
+
+  // Mover + colisiones
+  const {headHit, headSolid}=moveAndCollide(p,dt);
+
+  // Activar ceiling-stick si golpeaste cabeza dentro de la ventana del dash ↑
+  if(headHit && tNow <= p.ceilWindowEnd){
+    p.onCeiling=true; p.stuckCeil=headSolid; p.vx=0; p.vy=0;
+    const s=world.solids[headSolid]; p.y=s.y+s.h; // alinear
+    addPopup(p.x, p.y-0.6, "STICK", "#ffd0d0", 0.6);
+  }
+
+  // Reset recursos en suelo
+  if(p.onGround){ p.canDash=true; p.usedDashThisAir=false; p.canDouble=true; }
+
+  // Kill plane
+  if(p.y>RESPAWN_Y_KILL) respawn();
+}
+
+/* ===================== RENDER ===================== */
+function draw(){
+  const p=player;
+  ctx.clearRect(0,0,BASE_WIDTH,BASE_HEIGHT);
+  const cam={x:u(p.x)-BASE_WIDTH*0.4,y:u(p.y)-BASE_HEIGHT*0.6};
+
+  // Fondo + grid
+  ctx.fillStyle="#0b0d12"; ctx.fillRect(0,0,BASE_WIDTH,BASE_HEIGHT);
+  ctx.strokeStyle="rgba(255,255,255,0.035)"; ctx.lineWidth=1;
+  for(let gx=-(cam.x%u(2));gx<BASE_WIDTH;gx+=u(2)){ctx.beginPath();ctx.moveTo(gx,0);ctx.lineTo(gx,BASE_HEIGHT);ctx.stroke();}
+  for(let gy=-(cam.y%u(2));gy<BASE_HEIGHT;gy+=u(2)){ctx.beginPath();ctx.moveTo(0,gy);ctx.lineTo(BASE_WIDTH,gy);ctx.stroke();}
+
+  // Sólidos
+  for(const s of world.solids){
+    ctx.fillStyle="#1a2030"; ctx.strokeStyle="rgba(255,255,255,.08)"; ctx.lineWidth=2;
+    ctx.fillRect(u(s.x)-cam.x,u(s.y)-cam.y,u(s.w),u(s.h));
+    ctx.strokeRect(u(s.x)-cam.x,u(s.y)-cam.y,u(s.w),u(s.h));
+  }
+
+  // Goal
+  const g=world.goal;
+  ctx.fillStyle="#98fb98"; ctx.fillRect(u(g.x)-cam.x,u(g.y)-cam.y,u(g.w),u(g.h));
+  ctx.fillStyle="#2b6444"; ctx.fillRect(u(g.x)+u(.2)-cam.x,u(g.y)+u(.2)-cam.y,(g.w-.4)*UNIT,(g.h-.4)*UNIT);
+
+  // FX rings
+  for(const r of rings){
+    const t = 1 - (r.life/r.max);
+    const R = (r.r0 + (r.r1 - r.r0)*t) * UNIT;
+    const alpha = Math.max(0, r.life/r.max);
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = r.color; ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(u(r.x)-cam.x, u(r.y)-cam.y, R, 0, Math.PI*2);
+    ctx.stroke(); ctx.globalAlpha=1;
+  }
+
+  // Fantasmas dash
+  for(const gh of ghosts){
+    const alpha=Math.max(0, gh.life/GHOST_LIFE);
+    ctx.globalAlpha=0.25*alpha; ctx.fillStyle="#fff";
+    ctx.fillRect(u(gh.x)-cam.x,u(gh.y)-cam.y,u(gh.w),u(gh.h)); ctx.globalAlpha=1;
+  }
+
+  // Player
+  const px=u(p.x)-cam.x, py=u(p.y)-cam.y;
+  const color = p.onCeiling? CEILING_COLOR : p.dashFx>0? "#ffe38b" : (!p.onGround? "#7dd3fc" : "#c8e1ff");
+  ctx.fillStyle=color; ctx.strokeStyle="rgba(0,0,0,.45)"; ctx.lineWidth=2;
+  ctx.fillRect(px,py,u(p.w),u(p.h)); ctx.strokeRect(px,py,u(p.w),u(p.h));
+
+  // POGO READY: indicador visual mientras el buffer está activo
+  if(player.pogoBuffer>0 && !p.onGround){
+    const t = player.pogoBuffer / POGO_BUFFER; // 0..1
+    const w = u(p.w), h = u(p.h);
+    // flecha hacia abajo
+    ctx.globalAlpha = 0.6 * t;
+    ctx.fillStyle = "#ffec6e";
+    ctx.beginPath();
+    const cx = px + w/2, y = py + h + 10;
+    ctx.moveTo(cx, y);
+    ctx.lineTo(cx-10, y-14);
+    ctx.lineTo(cx+10, y-14);
+    ctx.closePath();
+    ctx.fill();
+    // halo en pies
+    ctx.globalAlpha = 0.35 * t;
+    ctx.beginPath(); ctx.arc(cx, py+h+2, 12+6*(1-t), 0, Math.PI*2); ctx.strokeStyle="#ffec6e"; ctx.lineWidth=3; ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // Glow dash
+  if(p.dashFx>0){
+    ctx.globalAlpha=0.18*(p.dashFx/DASH_FX_TIME);
+    ctx.fillStyle="#fff"; ctx.fillRect(px-6,py-6,u(p.w)+12,u(p.h)+12); ctx.globalAlpha=1;
+  }
+}
+
+/* ===================== HUD ===================== */
+const hud=document.getElementById("hud");
+function drawHUD(){
+  const p=player;
+  hud.textContent =
+`ceiling: ${p.onCeiling?"ON":"OFF"}   coyote: ${p.coyoteTimer>0?"ON":"OFF"}   buffer: ${p.bufferTimer>0?"ON":"OFF"}
+pogoBuf(ms): ${(p.pogoBuffer*1000|0)}   dash: ${p.canDash?1:0}   dblJump: ${(p.canDouble && !p.usedDashThisAir)?1:0}
+velX: ${p.vx.toFixed(2)}   velY: ${p.vy.toFixed(2)}   airTime: ${(p.airTime*1000|0)}   intentos: ${p.respawns}`;
+}
+
+/* ===================== LOOP ===================== */
+let acc=0, last=performance.now()/1000;
+function loop(){
+  const t=performance.now()/1000; acc+=Math.min(0.25,t-last); last=t;
+  while(acc>=FIXED_DT){ update(FIXED_DT); acc-=FIXED_DT; }
+  draw(); drawHUD(); requestAnimationFrame(loop);
+}
+
+/* ===================== RESPAWN ===================== */
+function respawn(){
+  Object.assign(player,{
+    x:world.start.x,y:world.start.y,vx:0,vy:0,
+    onGround:false,onLeftWall:false,onRightWall:false,
+    onCeiling:false,stuckCeil:-1,ceilWindowEnd:0,
+    coyoteTimer:0,bufferTimer:-999,jumpHeldTimer:0,
+    canDouble:true,canDash:true,usedDashThisAir:false,
+    pogoBuffer:0,dashFx:0,airTime:0,respawns:player.respawns+1
+  });
+  ghosts.length=0; rings.length=0; popups.length=0;
+}
+respawn(); player.respawns=0; loop();
+</script>
+</body>
+</html>
